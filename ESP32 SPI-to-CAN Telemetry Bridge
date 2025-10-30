@@ -1,0 +1,388 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <mcp2515.h>
+
+// ==================== CONFIGURATION ====================
+// SPI Pins for MCP2515 CAN Controller
+#define CAN_CS_PIN    5
+#define CAN_INT_PIN   21  // Interrupt pin (optional but recommended)
+
+// SPI Pins for Sensors (using VSPI)
+#define SENSOR_CS_PIN 15
+#define SPI_MOSI      23
+#define SPI_MISO      19
+#define SPI_SCK       18
+
+// CAN Bus Speed - 500 kbps (standard for automotive/racing)
+#define CAN_SPEED     CAN_500KBPS
+
+// Telemetry Update Rates (milliseconds)
+#define BATTERY_UPDATE_RATE    100   // 10 Hz
+#define MOTOR_UPDATE_RATE      50    // 20 Hz
+#define SENSOR_UPDATE_RATE     100   // 10 Hz
+#define SPEED_UPDATE_RATE      50    // 20 Hz
+
+// ==================== CAN MESSAGE IDs ====================
+// Standard Eco-shell CAN IDs (11-bit identifiers)
+#define CAN_ID_BATTERY_VOLTAGE    0x100  // Battery pack voltage
+#define CAN_ID_BATTERY_CURRENT    0x101  // Battery pack current
+#define CAN_ID_BATTERY_TEMP       0x102  // Battery temperature
+#define CAN_ID_BATTERY_SOC        0x103  // State of Charge
+
+#define CAN_ID_MOTOR_RPM          0x200  // Motor RPM
+#define CAN_ID_MOTOR_TEMP         0x201  // Motor temperature
+#define CAN_ID_MOTOR_CURRENT      0x202  // Motor current
+
+#define CAN_ID_VEHICLE_SPEED      0x300  // Vehicle speed
+#define CAN_ID_ACCELERATION       0x301  // Acceleration (X,Y,Z)
+#define CAN_ID_AMBIENT_TEMP       0x302  // Ambient temperature
+
+#define CAN_ID_EFFICIENCY         0x400  // Energy efficiency (Wh/km)
+#define CAN_ID_DISTANCE           0x401  // Total distance traveled
+#define CAN_ID_POWER              0x402  // Instantaneous power
+
+#define CAN_ID_STATUS             0x500  // System status flags
+#define CAN_ID_ERRORS             0x501  // Error codes
+
+// ==================== GLOBAL OBJECTS ====================
+MCP2515 mcp2515(CAN_CS_PIN);
+SPIClass sensorSPI(VSPI);
+
+// Timing variables
+unsigned long lastBatteryUpdate = 0;
+unsigned long lastMotorUpdate = 0;
+unsigned long lastSensorUpdate = 0;
+unsigned long lastSpeedUpdate = 0;
+
+// ==================== DATA STRUCTURES ====================
+struct BatteryData {
+    float voltage;        // Volts
+    float current;        // Amps
+    float temperature;    // Celsius
+    uint8_t soc;         // State of Charge (0-100%)
+    float totalEnergy;   // Wh consumed
+};
+
+struct MotorData {
+    uint16_t rpm;
+    float temperature;
+    float current;
+    float power;
+};
+
+struct VehicleData {
+    float speed;          // km/h
+    float distance;       // km
+    float efficiency;     // Wh/km
+    int16_t accel_x;      // mg (milli-g)
+    int16_t accel_y;
+    int16_t accel_z;
+};
+
+struct SystemStatus {
+    uint8_t errors;
+    bool battery_ok;
+    bool motor_ok;
+    bool sensor_ok;
+};
+
+BatteryData battery;
+MotorData motor;
+VehicleData vehicle;
+SystemStatus status;
+
+// ==================== SPI SENSOR FUNCTIONS ====================
+// Example: Reading from typical SPI sensors
+// Adapt these functions to your specific sensor protocols
+
+float readBatteryVoltageSPI() {
+    // Typical voltage divider reading via SPI ADC
+    // Example for MCP3008 or similar SPI ADC
+    sensorSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(SENSOR_CS_PIN, LOW);
+    
+    uint8_t cmd[3] = {0x01, 0x80, 0x00}; // Start bit, single-ended CH0
+    uint8_t result[3];
+    
+    for(int i = 0; i < 3; i++) {
+        result[i] = sensorSPI.transfer(cmd[i]);
+    }
+    
+    digitalWrite(SENSOR_CS_PIN, HIGH);
+    sensorSPI.endTransaction();
+    
+    // Convert 10-bit ADC to voltage (assuming 48V max with divider)
+    uint16_t adcValue = ((result[1] & 0x03) << 8) | result[2];
+    return (adcValue / 1023.0) * 48.0; // Scale to battery voltage range
+}
+
+float readBatteryCurrentSPI() {
+    // Read current sensor (e.g., ACS712 via ADC)
+    // Similar SPI read with different channel
+    return analogRead(34) * (50.0 / 4095.0); // Example: 0-50A range
+}
+
+float readTemperatureSPI(uint8_t sensor) {
+    // Read temperature sensor (e.g., MAX31855 thermocouple)
+    sensorSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(SENSOR_CS_PIN, LOW);
+    
+    uint32_t data = 0;
+    for(int i = 0; i < 4; i++) {
+        data <<= 8;
+        data |= sensorSPI.transfer(0x00);
+    }
+    
+    digitalWrite(SENSOR_CS_PIN, HIGH);
+    sensorSPI.endTransaction();
+    
+    // Convert to temperature (specific to MAX31855)
+    int16_t temp = (data >> 18) & 0x3FFF;
+    if(temp & 0x2000) temp |= 0xC000; // Sign extend
+    return temp * 0.25;
+}
+
+void readAccelerometerSPI() {
+    // Example for ADXL345 or similar SPI accelerometer
+    // Read X, Y, Z axis data
+    vehicle.accel_x = random(-100, 100); // Replace with actual SPI read
+    vehicle.accel_y = random(-100, 100);
+    vehicle.accel_z = random(950, 1050); // ~1g at rest
+}
+
+uint16_t readMotorRPM() {
+    // Read from motor controller via SPI or calculate from hall sensor
+    return analogRead(35) * 10; // Example: scale ADC to RPM
+}
+
+// ==================== CAN TRANSMISSION FUNCTIONS ====================
+void sendCANMessage(uint16_t id, uint8_t* data, uint8_t len) {
+    struct can_frame frame;
+    frame.can_id = id;
+    frame.can_dlc = len;
+    memcpy(frame.data, data, len);
+    
+    if(mcp2515.sendMessage(&frame) != MCP2515::ERROR_OK) {
+        Serial.println("Error sending CAN message");
+        status.errors++;
+    }
+}
+
+void sendBatteryData() {
+    uint8_t data[8];
+    
+    // Battery Voltage (CAN ID 0x100)
+    uint16_t voltage = (uint16_t)(battery.voltage * 100); // 0.01V resolution
+    data[0] = voltage >> 8;
+    data[1] = voltage & 0xFF;
+    sendCANMessage(CAN_ID_BATTERY_VOLTAGE, data, 2);
+    
+    // Battery Current (CAN ID 0x101)
+    int16_t current = (int16_t)(battery.current * 100); // 0.01A resolution
+    data[0] = current >> 8;
+    data[1] = current & 0xFF;
+    sendCANMessage(CAN_ID_BATTERY_CURRENT, data, 2);
+    
+    // Battery Temperature (CAN ID 0x102)
+    int16_t temp = (int16_t)(battery.temperature * 10); // 0.1°C resolution
+    data[0] = temp >> 8;
+    data[1] = temp & 0xFF;
+    sendCANMessage(CAN_ID_BATTERY_TEMP, data, 2);
+    
+    // Battery SOC (CAN ID 0x103)
+    data[0] = battery.soc;
+    sendCANMessage(CAN_ID_BATTERY_SOC, data, 1);
+}
+
+void sendMotorData() {
+    uint8_t data[8];
+    
+    // Motor RPM (CAN ID 0x200)
+    data[0] = motor.rpm >> 8;
+    data[1] = motor.rpm & 0xFF;
+    sendCANMessage(CAN_ID_MOTOR_RPM, data, 2);
+    
+    // Motor Temperature (CAN ID 0x201)
+    int16_t temp = (int16_t)(motor.temperature * 10);
+    data[0] = temp >> 8;
+    data[1] = temp & 0xFF;
+    sendCANMessage(CAN_ID_MOTOR_TEMP, data, 2);
+    
+    // Motor Current (CAN ID 0x202)
+    int16_t current = (int16_t)(motor.current * 100);
+    data[0] = current >> 8;
+    data[1] = current & 0xFF;
+    sendCANMessage(CAN_ID_MOTOR_CURRENT, data, 2);
+}
+
+void sendVehicleData() {
+    uint8_t data[8];
+    
+    // Vehicle Speed (CAN ID 0x300)
+    uint16_t speed = (uint16_t)(vehicle.speed * 10); // 0.1 km/h resolution
+    data[0] = speed >> 8;
+    data[1] = speed & 0xFF;
+    sendCANMessage(CAN_ID_VEHICLE_SPEED, data, 2);
+    
+    // Acceleration (CAN ID 0x301) - all 3 axes in one message
+    data[0] = vehicle.accel_x >> 8;
+    data[1] = vehicle.accel_x & 0xFF;
+    data[2] = vehicle.accel_y >> 8;
+    data[3] = vehicle.accel_y & 0xFF;
+    data[4] = vehicle.accel_z >> 8;
+    data[5] = vehicle.accel_z & 0xFF;
+    sendCANMessage(CAN_ID_ACCELERATION, data, 6);
+    
+    // Efficiency (CAN ID 0x400)
+    uint16_t efficiency = (uint16_t)(vehicle.efficiency * 10);
+    data[0] = efficiency >> 8;
+    data[1] = efficiency & 0xFF;
+    sendCANMessage(CAN_ID_EFFICIENCY, data, 2);
+    
+    // Distance (CAN ID 0x401)
+    uint32_t distance = (uint32_t)(vehicle.distance * 1000); // meters
+    data[0] = (distance >> 24) & 0xFF;
+    data[1] = (distance >> 16) & 0xFF;
+    data[2] = (distance >> 8) & 0xFF;
+    data[3] = distance & 0xFF;
+    sendCANMessage(CAN_ID_DISTANCE, data, 4);
+    
+    // Power (CAN ID 0x402)
+    uint16_t power = (uint16_t)(motor.power * 10);
+    data[0] = power >> 8;
+    data[1] = power & 0xFF;
+    sendCANMessage(CAN_ID_POWER, data, 2);
+}
+
+void sendStatusData() {
+    uint8_t data[8];
+    
+    // System Status (CAN ID 0x500)
+    data[0] = (status.battery_ok << 0) | 
+              (status.motor_ok << 1) | 
+              (status.sensor_ok << 2);
+    data[1] = battery.soc;
+    sendCANMessage(CAN_ID_STATUS, data, 2);
+    
+    // Error Codes (CAN ID 0x501)
+    data[0] = status.errors;
+    sendCANMessage(CAN_ID_ERRORS, data, 1);
+}
+
+// ==================== SENSOR DATA COLLECTION ====================
+void updateSensorData() {
+    // Battery readings
+    battery.voltage = readBatteryVoltageSPI();
+    battery.current = readBatteryCurrentSPI();
+    battery.temperature = readTemperatureSPI(0);
+    
+    // Simple SOC estimation (voltage-based, improve with coulomb counting)
+    battery.soc = constrain(map(battery.voltage, 36.0, 42.0, 0, 100), 0, 100);
+    
+    // Motor readings
+    motor.rpm = readMotorRPM();
+    motor.temperature = readTemperatureSPI(1);
+    motor.current = battery.current; // Same as battery current for single motor
+    motor.power = battery.voltage * battery.current;
+    
+    // Vehicle calculations
+    vehicle.speed = (motor.rpm * 3.14159 * 0.4) / 60.0; // Assuming 0.4m wheel diameter
+    readAccelerometerSPI();
+    
+    // Efficiency calculation
+    static float totalEnergy = 0;
+    totalEnergy += (battery.voltage * battery.current * 0.1) / 3600.0; // Wh
+    battery.totalEnergy = totalEnergy;
+    
+    if(vehicle.distance > 0.01) {
+        vehicle.efficiency = totalEnergy / vehicle.distance;
+    }
+    
+    // Update distance
+    static unsigned long lastDistUpdate = 0;
+    unsigned long now = millis();
+    float deltaTime = (now - lastDistUpdate) / 1000.0 / 3600.0; // hours
+    vehicle.distance += vehicle.speed * deltaTime;
+    lastDistUpdate = now;
+    
+    // Status checks
+    status.battery_ok = (battery.voltage > 36.0 && battery.temperature < 60.0);
+    status.motor_ok = (motor.temperature < 80.0 && motor.current < 45.0);
+    status.sensor_ok = true;
+}
+
+// ==================== SETUP ====================
+void setup() {
+    Serial.begin(115200);
+    Serial.println("Eco-shell Telemetry System Starting...");
+    
+    // Initialize SPI for sensors
+    sensorSPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SENSOR_CS_PIN);
+    pinMode(SENSOR_CS_PIN, OUTPUT);
+    digitalWrite(SENSOR_CS_PIN, HIGH);
+    
+    // Initialize MCP2515 CAN Controller
+    SPI.begin();
+    mcp2515.reset();
+    mcp2515.setBitrate(CAN_SPEED, MCP_8MHZ); // Adjust crystal freq if needed
+    mcp2515.setNormalMode();
+    
+    Serial.println("CAN Bus initialized at 500 kbps");
+    
+    // Initialize data structures
+    memset(&battery, 0, sizeof(battery));
+    memset(&motor, 0, sizeof(motor));
+    memset(&vehicle, 0, sizeof(vehicle));
+    memset(&status, 0, sizeof(status));
+    status.battery_ok = true;
+    status.motor_ok = true;
+    status.sensor_ok = true;
+    
+    Serial.println("System Ready!");
+    Serial.println("CAN ID Map:");
+    Serial.println("0x100-0x103: Battery Data");
+    Serial.println("0x200-0x202: Motor Data");
+    Serial.println("0x300-0x302: Vehicle/Sensor Data");
+    Serial.println("0x400-0x402: Efficiency/Performance");
+    Serial.println("0x500-0x501: Status/Errors");
+}
+
+// ==================== MAIN LOOP ====================
+void loop() {
+    unsigned long currentTime = millis();
+    
+    // Always update sensor readings
+    updateSensorData();
+    
+    // Send battery data at configured rate
+    if(currentTime - lastBatteryUpdate >= BATTERY_UPDATE_RATE) {
+        sendBatteryData();
+        lastBatteryUpdate = currentTime;
+    }
+    
+    // Send motor data at configured rate
+    if(currentTime - lastMotorUpdate >= MOTOR_UPDATE_RATE) {
+        sendMotorData();
+        lastMotorUpdate = currentTime;
+    }
+    
+    // Send vehicle/sensor data at configured rate
+    if(currentTime - lastSensorUpdate >= SENSOR_UPDATE_RATE) {
+        sendVehicleData();
+        lastSensorUpdate = currentTime;
+    }
+    
+    // Send status periodically (1 Hz)
+    static unsigned long lastStatusUpdate = 0;
+    if(currentTime - lastStatusUpdate >= 1000) {
+        sendStatusData();
+        lastStatusUpdate = currentTime;
+        
+        // Debug output to Serial
+        Serial.printf("V: %.2fV | I: %.2fA | SOC: %d%% | Speed: %.1f km/h | Eff: %.1f Wh/km\n",
+                      battery.voltage, battery.current, battery.soc, 
+                      vehicle.speed, vehicle.efficiency);
+    }
+    
+    delay(10); // Small delay to prevent overwhelming the CAN bus
+}
