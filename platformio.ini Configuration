@@ -1,0 +1,21 @@
+[env:esp32dev]
+platform = espressif32
+board = esp32dev
+framework = arduino
+monitor_speed = 115200
+
+; MCP2515 CAN Library
+lib_deps = 
+    autowp/mcp2515@^1.0.1
+
+; Upload settings
+upload_speed = 921600
+
+; Build flags
+build_flags = 
+    -D CORE_DEBUG_LEVEL=3
+    
+; Serial monitor filters
+monitor_filters = 
+    default
+    time
